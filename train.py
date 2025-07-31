@@ -1,6 +1,5 @@
 from collections import defaultdict
 import json
-import random
 from src.networks.utils.utils import MultiBoundGraphDataset
 from src.networks.gnn import GATModel
 import torch
@@ -14,7 +13,9 @@ import gc
 
 num_epochs = 20
 batch_size = 4
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+result_weight = 0.9
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device {device}.")
 
 base_path = Path("data/final_graphs")
@@ -24,7 +25,7 @@ loop_tokens = []
 node_files = []
 edge_files = []
 result_files = []
-result_weight = 0.9
+
 
 def compute_global_weights_from_json(result_files):
     labels = []
@@ -43,7 +44,7 @@ def compute_global_weights_from_json(result_files):
 
     # Avoid division by zero
     if num_pos == 0:
-        pos_weight = torch.tensor([1.0])  # fallback
+        pos_weight = torch.tensor([1.0])
     else:
         pos_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32)
 
@@ -52,42 +53,15 @@ def compute_global_weights_from_json(result_files):
 
     return pos_weight
 
+
 def normalise_label(output):
     result = output[:, 0]
     time = output[:, 1]
     time = torch.clamp(time, max=60)
-    #n_result = (result + 1) / 2
     n_result = (result == 1).float()
     n_time = 1 - time / 60
     return n_result, n_time
 
-# def compute_global_weights(dataset):
-#     labels = []
-#     count = 0
-#     for data in dataset:
-#         count += 1
-#         print(f"Sample {count}")
-#         result_label, _ = normalise_label(data.y)
-#         labels.append(result_label)
-
-#     labels = torch.cat(labels)
-#     num_1 = (labels == 1).sum().item()
-#     num_0 = (labels == 0).sum().item()
-#     total = num_1 + num_0
-
-#     freq_1 = num_1 / total
-#     freq_0 = num_0 / total
-
-#     weight_1 = 1 / freq_1 if freq_1 != 0 else 1
-#     weight_0 = 1 / freq_0 if freq_0 != 0 else 1
-
-#     return {1: weight_1, 0: weight_0}
-
-def get_sample_weights(labels, global_weights):
-    weights = torch.zeros_like(labels, dtype=torch.float)
-    weights[labels == 1] = global_weights[1]
-    weights[labels == 0] = global_weights[0]
-    return weights.to(device)
 
 def train(model, dataloader, optimizer, criterion_class, criterion_reg, device):
     model.train()
@@ -142,29 +116,27 @@ def evaluate(model, dataloader, criterion_class, criterion_reg, device):
             data_list = batch.to_data_list()
             for i, data in enumerate(data_list):
                 result_file = getattr(data, "result_file", f"unknown_{batch_idx}_{i}")
-                result_file_groups[result_file].append({
-                    "result_pred": result_pred[i].item(),
-                    "result_label": result_label[i].item(),
-                    "time_pred": time_pred[i].item(),
-                    "time_label": time_label[i].item(),
-                    # "weight": sample_weights[i].item(),
-                })
+                result_file_groups[result_file].append(
+                    {
+                        "result_pred": result_pred[i].item(),
+                        "result_label": result_label[i].item(),
+                        "time_pred": time_pred[i].item(),
+                        "time_label": time_label[i].item(),
+                    }
+                )
 
             loop.set_postfix(loss=loss.item())
 
-    # 统计正确和总数
     correct = 0
     total = 0
     for result_file, results in result_file_groups.items():
         labels = [item["result_label"] for item in results]
         preds = [item["result_pred"] for item in results]
 
-        # 打印每个文件的预测和真实值
         print(f"\nResult file: {result_file}")
         for i, (p, l) in enumerate(zip(preds, labels)):
             prob = torch.sigmoid(torch.tensor(p)).item()
             print(f"  Instance {i}: Pred = {prob:.4f}, Label = {l}")
-            #print(f"  Instance {i}: Pred = {p:.4f}, Label = {l}")
 
         if 1 in labels:
             total += 1
@@ -177,42 +149,6 @@ def evaluate(model, dataloader, criterion_class, criterion_reg, device):
 
     return total_loss / len(dataloader)
 
-
-def train_one_more_epoch(model,
-                         model_path,
-                         loader,
-                         train_val_loader,
-                         val_loader,
-                         optimizer,
-                         criterion_class,
-                         criterion_reg,
-                         device,
-                         best_val_loss=float('inf')):
-
-    model.load_state_dict(torch.load(model_path))
-    model.to(device)
-    model.train()
-
-    print('Training one more epoch')
-
-    train_loss = train(model, loader, optimizer, criterion_class, criterion_reg, device)
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    print('Trainset accuracy:')
-    _ = evaluate(model, train_val_loader, criterion_class, criterion_reg, device)
-
-    print('Valset accuracy:')
-    val_loss = evaluate(model, val_loader, criterion_class, criterion_reg, device)
-
-    print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        torch.save(model.state_dict(), model_path)
-        print("Saved improved model!")
-
-    return val_loss
 
 for subdir in base_path.iterdir():
     if subdir.is_dir() and subdir.name.startswith("pals_lcr"):
@@ -233,41 +169,15 @@ for subdir in base_path.iterdir():
             edge_files.append(str(edge_file))
             result_files.append(str(result_file))
 
-assert len(loop_tokens) == len(node_files) == len(edge_files) == len(result_files), \
-    f"Array lengths differ: loop_tokens={len(loop_tokens)}, node_files={len(node_files)}, edge_files={len(edge_files)}, result_files={len(result_files)}"
-
-# combined = list(zip(loop_tokens, node_files, edge_files, result_files))
-# random.shuffle(combined)
-# loop_tokens, node_files, edge_files, result_files = zip(*combined)
-
-# node_files = node_files[:10]
-# loop_tokens = loop_tokens[:10]
-# edge_files = edge_files[:10]
-# result_files = result_files[:10]
-
+assert (
+    len(loop_tokens) == len(node_files) == len(edge_files) == len(result_files)
+), f"Array lengths differ: loop_tokens={len(loop_tokens)}, node_files={len(node_files)}, edge_files={len(edge_files)}, result_files={len(result_files)}"
 
 print(len(node_files))
 split_idx = floor(len(node_files) * 0.8)
 print(len(node_files[:split_idx]))
 print(len(node_files[split_idx:]))
-# group_id = 0 # 初始化 Group ID
 
-# for file in val_result:
-#     with open(file) as f:
-#         result_json = json.load(f)
-    
-#     labels = [item["result"] for item in result_json["results"]]
-    
-#     #if any(1 in label for label in labels):
-#     print(f"Group {group_id}: File: {file}")
-#     print("   Labels:")
-#     for label in labels:
-#         print(f"   {label}")
-#     group_id += 1  # 仅在满足条件时才递增
-
-
-# exit(0)
-# 前90%
 train_dataset = MultiBoundGraphDataset(
     node_files=node_files[:split_idx],
     edge_files=edge_files[:split_idx],
@@ -275,44 +185,27 @@ train_dataset = MultiBoundGraphDataset(
     result_files=result_files[:split_idx],
 )
 
-# 后10%
 val_dataset = MultiBoundGraphDataset(
     node_files=node_files[split_idx:],
     edge_files=edge_files[split_idx:],
     loop_tokens=loop_tokens[split_idx:],
     result_files=result_files[split_idx:],
 )
-print('calulating weight...')
+print("calulating weight...")
 pos_weight = compute_global_weights_from_json(result_files[:split_idx]).to(device)
 inputLayerSize = train_dataset[0].x.size(1)
 model = GATModel(in_channels=inputLayerSize, hidden_channels=inputLayerSize).to(device)
-model.load_state_dict(torch.load('model.pth'))
 loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-train_val_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-# criterion_class = nn.BCELoss()
+val_loader = DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
+)
+train_val_loader = DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=False, num_workers=4
+)
 criterion_class = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 criterion_reg = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
 best_val_loss = float("inf")
-# model.load_state_dict(torch.load('model.pth'))
-# model.to(device)
-# val_loss = evaluate(model, train_val_loader, criterion_class, criterion_reg, device)
-# best_val_loss = 0.1190
-
-# best_val_loss = train_one_more_epoch(
-#     model=model,
-#     model_path="model.pth",
-#     loader=loader,
-#     train_val_loader=train_val_loader,
-#     val_loader=val_loader,
-#     optimizer=optimizer,
-#     criterion_class=criterion_class,
-#     criterion_reg=criterion_reg,
-#     device=device,
-#     best_val_loss=best_val_loss
-# )
-# exit(0)
 
 for epoch in range(1, num_epochs + 1):
     print(f"\n Epoch {epoch}/{num_epochs}")
@@ -320,12 +213,8 @@ for epoch in range(1, num_epochs + 1):
     train_loss = train(model, loader, optimizer, criterion_class, criterion_reg, device)
     torch.cuda.empty_cache()
     gc.collect()
-    print('Trainset accuracy:')
-    val_loss = evaluate(model, train_val_loader, criterion_class, criterion_reg, device)
-    torch.cuda.empty_cache()
-    gc.collect()
     val_loss = evaluate(model, val_loader, criterion_class, criterion_reg, device)
-    print('Valset accuracy:')
+    print("Valset accuracy:")
     print(f" Train Loss: {train_loss:.4f} |  Val Loss: {val_loss:.4f}")
 
     # save the best model
