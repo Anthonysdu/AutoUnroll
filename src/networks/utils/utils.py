@@ -9,10 +9,15 @@ from torch_geometric.data import Dataset as GDataset
 
 class MultiBoundGraphDataset(GDataset):
     def __init__(
-        self, node_files, edge_files, loop_tokens, result_files, transform=None
+        self, node_files, edge_files, loop_tokens, result_files, mode, full_encode, edges, transform=None,
     ):
         self.transform = transform
         self.graph_infos = []
+        self.mode = mode
+        self.full_encode = full_encode
+        self.edges_to_use = edges
+
+        edge_type_map = {0: "AST", 1: "ICFG", 2: "Data"}
 
         for node_file, edge_file, loop_token, result_file in zip(
             node_files, edge_files, loop_tokens, result_files
@@ -22,21 +27,26 @@ class MultiBoundGraphDataset(GDataset):
             node_data = np.load(node_file)
             x = torch.tensor(node_data["node_rep"], dtype=torch.float)
 
-            # edge data — 只保留 ICFG 边
             edge_data = np.load(edge_file)
-            icfg_edges = (
-                torch.tensor(edge_data["ICFG"], dtype=torch.long).t().contiguous()
-            )
-            edge_index = icfg_edges
+            edge_index_list = []
+            edge_attr_list = []
+            for e_type in self.edges_to_use:
+                key = edge_type_map[e_type]
+                if key in edge_data:
+                    print(key)
+                    edges = torch.tensor(edge_data[key], dtype=torch.long).t().contiguous()
+                    edge_index_list.append(edges)
+                    edge_attr_type = torch.full((edges.size(1), 1), e_type, dtype=torch.float)
+                    edge_attr_list.append(edge_attr_type)
+            if edge_index_list:
+                edge_index = torch.cat(edge_index_list, dim=1)
+                edge_attr = torch.cat(edge_attr_list, dim=0)
+            else:
+                assert(0)
 
-            # edge_attr_type：ICFG 类型设为 2
-            edge_attr_type = torch.full((icfg_edges.size(1), 1), 2, dtype=torch.float)
-
-            # 记录 source nodes
             src_nodes = edge_index[0].tolist()
             token_data = json.load(open(loop_token))
 
-            # 结果与展开因子
             result_json = json.load(open(result_file))
             labels = [item["result"] for item in result_json["results"]]
             bounds = [
@@ -48,7 +58,7 @@ class MultiBoundGraphDataset(GDataset):
                 (
                     x,
                     edge_index,
-                    edge_attr_type,
+                    edge_attr,
                     src_nodes,
                     token_data,
                     bounds,
@@ -73,7 +83,7 @@ class MultiBoundGraphDataset(GDataset):
         (
             x,
             edge_index,
-            edge_attr_type,
+            edge_attr,
             src_nodes,
             token_data,
             bounds,
@@ -83,148 +93,48 @@ class MultiBoundGraphDataset(GDataset):
         bound = bounds[b_idx]
         label = torch.tensor([labels[b_idx]], dtype=torch.float)
 
-        # 添加展开因子作为 node 特征（图级最大值）
         graph_max_unwind = max(bound.values()) if bound else 0
         graph_max_unwind_tensor = torch.full((x.size(0), 1), float(graph_max_unwind))
         x = torch.cat([x, graph_max_unwind_tensor], dim=1)
-
-        # 计算每条边的 unwind 属性（upper_bound 被移除）
-        unwind_attr = []
-        for src in src_nodes:
-            token_str = str(src)
-            if token_str in token_data:
-                loopid = token_data[token_str]["loop_id"]
-                unwind_val = bound.get(loopid, 0)
+        node_unwind = torch.zeros(x.size(0), 1) 
+        if self.mode == 1:
+            unwind_attr = []
+            if self.full_encode:
+                for src in src_nodes:
+                    unwind_val = 0
+                    for token_str, token_info in token_data.items():
+                        loopid = token_info['loop_id']
+                        reachable = token_info.get('reachable', [])
+                        if src in reachable:
+                            unwind_val += bound.get(loopid, 0)
+                    unwind_attr.append(unwind_val)
             else:
-                unwind_val = 0
-            unwind_attr.append(unwind_val)
+                unwind_attr = []
+                for src in src_nodes:
+                    token_str = str(src)
+                    if token_str in token_data:
+                        loopid = token_data[token_str]["loop_id"]
+                        unwind_val = bound.get(loopid, 0)
+                    else:
+                        unwind_val = 0
+                    unwind_attr.append(unwind_val)
+            unwind_attr = torch.tensor(unwind_attr, dtype=torch.float).unsqueeze(1)
 
-        unwind_attr = torch.tensor(unwind_attr, dtype=torch.float).unsqueeze(1)
+            edge_attr = torch.cat([edge_attr, unwind_attr], dim=1)
+        else:
+            for node_id in range(x.size(0)):
+                val = 0
+                for token_str, token_info in token_data.items():
+                    loopid = token_info['loop_id']
+                    reachable = token_info.get('reachable', [])
+                    if node_id in reachable:
+                        val += bound.get(loopid, 0)
+                node_unwind[node_id, 0] = val
+            edge_attr = edge_attr
 
-        # 拼接最终 edge_attr: [edge_type, unwind_val]
-        edge_attr = torch.cat([edge_attr_type, unwind_attr], dim=1)
-
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=label)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=label, node_unwind=node_unwind)
         data.result_file = result_file
         data.unwind_dict = json.dumps(bound)
         if self.transform:
             data = self.transform(data)
         return data
-
-
-# Function to load graph data (node features and edges)
-def load_graph_data(node_file, edge_file):
-    node_data = np.load(node_file)
-    x = torch.tensor(
-        node_data["node_rep"], dtype=torch.float
-    )  # node feature (one-hot encoding)
-
-    edge_data = np.load(edge_file)
-    ast_edges = edge_data["AST"]
-    data_edges = edge_data["Data"]
-    icfg_edges = edge_data["ICFG"]
-    # lcfg_edges = edge_data["LCFG"]
-
-    ast_edges = torch.tensor(ast_edges, dtype=torch.long).t().contiguous()
-    data_edges = torch.tensor(data_edges, dtype=torch.long).t().contiguous()
-    icfg_edges = torch.tensor(icfg_edges, dtype=torch.long).t().contiguous()
-
-    edge_attr_ast = torch.full((ast_edges.size(1), 1), 0, dtype=torch.float)
-    edge_attr_data = torch.full((data_edges.size(1), 1), 1, dtype=torch.float)
-    edge_attr_icfg = torch.full((icfg_edges.size(1), 1), 2, dtype=torch.float)
-
-    edge_index = torch.cat([ast_edges, data_edges, icfg_edges], dim=1)
-    json_data = json.load(open("../../data/final_graphs/test.c.json"))
-    edge_attr_type = torch.cat([edge_attr_ast, edge_attr_data, edge_attr_icfg], dim=0)
-
-    src_nodes = edge_index[0].tolist()
-    file_path = "../../test.c.txt"
-    bounds, benchmark, verdit = extract_bounds_and_labels(file_path)
-    print(verdit)
-    data_list = []
-    for i, bound in enumerate(bounds):
-        unwind_attr = []
-        for src in src_nodes:
-            token_str = str(src)
-            if token_str in json_data:
-                loopid = json_data[token_str]
-                unwind_val = bound.get(loopid, 0)
-            else:
-                unwind_val = 0
-            unwind_attr.append(unwind_val)
-        unwind_attr = torch.tensor(unwind_attr, dtype=torch.float).unsqueeze(1)
-        edge_attr = torch.cat(
-            [edge_attr_type, unwind_attr], dim=1
-        )  # [edge_type, unwind]
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=verdit[i])
-        data_list.append(data)
-    return data_list
-
-
-# Function to load labels from a file
-def load_labels(label_file):
-    with open(label_file, "r") as f:
-        label_data = json.load(f)
-
-    labels_dict = {}
-    for item in label_data:
-        program_name = item["program_name"]
-        labels = item["labels"]
-        labels_dict[program_name] = labels
-    return labels_dict
-
-
-# Function to prepare data for training, validation, and testing
-def prepare_data(node_file, edge_file, label_file):
-    print(label_file)
-    return load_graph_data(node_file, edge_file)
-
-
-# Function to load data in batches
-def load_data_in_batches(label_file, batch_size):
-    labels_dict = load_labels(label_file)
-    print(labels_dict)
-    program_names = list(labels_dict.keys())
-
-    for i in range(0, len(program_names), batch_size):
-        batch_program_names = program_names[i : i + batch_size]
-        batch_data_list = []
-
-        for program_name in batch_program_names:
-            node_file = f"../../data/final_graphs/{program_name}.json.npz"
-            edge_file = f"../../data/final_graphs/{program_name}.jsonEdges.npz"
-            if os.path.exists(node_file) and os.path.exists(edge_file):
-                data_list = prepare_data(node_file, edge_file, label_file)
-                batch_data_list.extend(data_list)
-
-        # yield batch_data_list
-        return batch_data_list
-
-
-def extract_bounds_from_file(file_path):
-
-    with open(file_path, "r", encoding="utf-8") as file:
-        benchmark_with_verdict = file.readline().strip()
-        text = file.read()
-
-    pattern = r"(\d+):(\d+),(\d+):(\d+) (-?\d+) (\d+\.\d+)"
-
-    matches = re.findall(pattern, text)
-    extracted_numbers = []
-
-    for match in matches:
-        extracted_numbers.append(
-            {
-                int(match[0]): int(match[1]),
-                int(match[2]): int(match[3]),
-            }
-        )
-    labels = [(int(match[4]), float(match[5])) for match in matches]
-    return extracted_numbers, benchmark_with_verdict, labels
-
-
-def extract_bounds_and_labels(file_path):
-    file = json.load(file_path)
-    bounds = []
-    labels = []
-    return bounds, labels
